@@ -1,26 +1,33 @@
-const express = require('express');
-const crypto = require('crypto');
-const path = require('path');
-const app = express();
-app.disable('x-powered-by');
-app.use(express.json({ limit: '16kb' }));
-const PORT = Number(process.env.PORT) || 3552;
-const adminKey = process.env.ADMIN_KEY;
-const bootTime = Date.now();
-app.get('/', (_req, res) => res.json({ project: 'HYBRID OGFN', season: 'Chapter 1 Season 8', status: 'online', dashboard: '/dashboard' }));
-app.get('/health', (_req, res) => res.json({ status: 'ok' }));
-app.get('/api/matchmaking/status', (_req, res) => res.json({ status: 'waiting', players: 0, gameServerConnected: false }));
-function secureCompare(a, b) {
-  const aa = crypto.createHash('sha256').update(a).digest();
-  const bb = crypto.createHash('sha256').update(b).digest();
-  return crypto.timingSafeEqual(aa, bb);
-}
-app.get('/api/admin/overview', (req, res) => {
-  if (!adminKey) return res.status(503).json({ error: 'Admin access not configured. Set ADMIN_KEY in Render.' });
-  const token = req.get('x-admin-key') || '';
-  if (!secureCompare(token, adminKey)) return res.status(401).json({ error: 'Invalid admin key' });
-  res.set('Cache-Control', 'no-store');
-  res.json({ project: 'HYBRID OGFN', season: 'Chapter 1 Season 8', backend: 'online', uptimeSeconds: Math.floor((Date.now() - bootTime) / 1000), matchmaking: 'waiting', players: 0, gameServerConnected: false, bots: null, note: 'Game-server integration not yet configured. Counts are placeholders.' });
-});
-app.get('/dashboard', (_req, res) => res.sendFile(path.join(__dirname, 'dashboard.html')));
-app.listen(PORT, '0.0.0.0', () => console.log(`HYBRID backend running on port ${PORT}`));
+'use strict';
+const express=require('express');
+const crypto=require('crypto');
+const path=require('path');
+const {Pool}=require('pg');
+const app=express(); app.disable('x-powered-by'); app.use(express.json({limit:'32kb'}));
+const port=Number(process.env.PORT||3552);
+const pool=process.env.DATABASE_URL?new Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DB_SSL==='false'?false:{rejectUnauthorized:true},max:3}):null;
+const started=Date.now();
+const adminKey=process.env.ADMIN_KEY||'';
+const attempts=new Map();
+function equal(a,b){const x=crypto.createHash('sha256').update(a).digest(),y=crypto.createHash('sha256').update(b).digest();return crypto.timingSafeEqual(x,y)}
+function auth(req,res,next){const ip=req.ip,now=Date.now(),entry=attempts.get(ip)||{n:0,t:now};if(now-entry.t>60000){entry.n=0;entry.t=now} if(entry.n>=30)return res.status(429).json({error:'Rate limited'});const supplied=(req.get('authorization')||'').replace(/^Bearer\s+/i,'');if(!adminKey||adminKey.length<20||!equal(supplied,adminKey)){entry.n++;attempts.set(ip,entry);return res.status(401).json({error:'Unauthorized'})}attempts.delete(ip);next()}
+function db(req,res,next){if(!pool)return res.status(503).json({error:'Set DATABASE_URL for persistent storage'});next()}
+const wrap=fn=>(req,res,next)=>Promise.resolve(fn(req,res)).catch(next);
+async function audit(client,action,target,details){await client.query('INSERT INTO audit_log(action,target,details) VALUES($1,$2,$3)',[action,target,JSON.stringify(details||{})])}
+app.get('/health',(req,res)=>res.json({status:'ok'}));
+app.get('/',(req,res)=>res.json({project:'HYBRID OGFN',season:'Chapter 1 Season 8',status:'online'}));
+app.get('/api/matchmaking/status',wrap(async(req,res)=>{if(!pool)return res.json({status:'waiting',players:0,gameServerConnected:false});const q=await pool.query("SELECT value FROM settings WHERE key='matchmaking'");res.json({status:q.rows[0]?.value==='true'?'enabled':'disabled',players:0,gameServerConnected:false})}));
+app.get('/dashboard',(req,res)=>res.sendFile(path.join(__dirname,'dashboard.html')));
+app.get('/api/admin/overview',auth,wrap(async(req,res)=>{let players=null,banned=null,items=null,settings={};if(pool){const [a,b,c,d]=await Promise.all([pool.query('SELECT count(*)::int AS n FROM players'),pool.query('SELECT count(*)::int AS n FROM players WHERE banned=true'),pool.query('SELECT count(*)::int AS n FROM shop_items WHERE active=true'),pool.query('SELECT key,value FROM settings')]);players=a.rows[0].n;banned=b.rows[0].n;items=c.rows[0].n;settings=Object.fromEntries(d.rows.map(x=>[x.key,x.value]))}res.json({backend:'online',uptimeSeconds:Math.floor((Date.now()-started)/1000),database:!!pool,players,banned,shopItems:items,settings,gameServerConnected:false})}));
+app.get('/api/admin/players',auth,db,wrap(async(req,res)=>{const q=String(req.query.q||'').slice(0,80);const result=await pool.query('SELECT id,username,vbucks,banned,created_at FROM players WHERE username ILIKE $1 ORDER BY created_at DESC LIMIT 100',['%'+q+'%']);res.json(result.rows)}));
+app.post('/api/admin/players',auth,db,wrap(async(req,res)=>{const name=String(req.body.username||'').trim();if(!/^[a-zA-Z0-9_-]{3,24}$/.test(name))return res.status(400).json({error:'Username must be 3-24 letters, numbers, underscores or hyphens'});const c=await pool.connect();try{await c.query('BEGIN');const r=await c.query('INSERT INTO players(username) VALUES($1) RETURNING id,username,vbucks,banned',[name]);await audit(c,'player.create',r.rows[0].id,{username:name});await c.query('COMMIT');res.status(201).json(r.rows[0])}catch(e){await c.query('ROLLBACK');if(e.code==='23505')return res.status(409).json({error:'Username exists'});throw e}finally{c.release()}}));
+app.post('/api/admin/players/:id/vbucks',auth,db,wrap(async(req,res)=>{const delta=req.body.delta;if(!Number.isSafeInteger(delta)||delta===0||Math.abs(delta)>100000)return res.status(400).json({error:'Delta must be a nonzero integer within ±100000'});const c=await pool.connect();try{await c.query('BEGIN');const r=await c.query('UPDATE players SET vbucks=vbucks+$1 WHERE id=$2 AND vbucks+$1 BETWEEN 0 AND 100000000 RETURNING id,username,vbucks',[delta,req.params.id]);if(!r.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:'Player missing or balance limit reached'})}await audit(c,'vbucks.adjust',req.params.id,{delta,balance:r.rows[0].vbucks});await c.query('COMMIT');res.json(r.rows[0])}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}));
+app.post('/api/admin/players/:id/ban',auth,db,wrap(async(req,res)=>{if(typeof req.body.banned!=='boolean')return res.status(400).json({error:'banned must be boolean'});const c=await pool.connect();try{await c.query('BEGIN');const r=await c.query('UPDATE players SET banned=$1 WHERE id=$2 RETURNING id,username,banned',[req.body.banned,req.params.id]);if(!r.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:'Player not found'})}await audit(c,req.body.banned?'player.ban':'player.unban',req.params.id,{});await c.query('COMMIT');res.json(r.rows[0])}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}));
+app.get('/api/shop',db,wrap(async(req,res)=>{const r=await pool.query('SELECT id,name,price,active,updated_at FROM shop_items WHERE active=true ORDER BY updated_at DESC LIMIT 100');res.json(r.rows)}));
+app.get('/api/admin/shop',auth,db,wrap(async(req,res)=>{const r=await pool.query('SELECT id,name,price,active,updated_at FROM shop_items ORDER BY updated_at DESC LIMIT 100');res.json(r.rows)}));
+app.post('/api/admin/shop',auth,db,wrap(async(req,res)=>{const name=String(req.body.name||'').trim(),price=req.body.price;if(name.length<1||name.length>80||!Number.isSafeInteger(price)||price<0||price>1000000)return res.status(400).json({error:'Invalid item name or price'});const c=await pool.connect();try{await c.query('BEGIN');const r=await c.query('INSERT INTO shop_items(name,price) VALUES($1,$2) RETURNING *',[name,price]);await audit(c,'shop.create',r.rows[0].id,{name,price});await c.query('COMMIT');res.status(201).json(r.rows[0])}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}));
+app.patch('/api/admin/shop/:id',auth,db,wrap(async(req,res)=>{const {name,price,active}=req.body;if(name===undefined&&price===undefined&&active===undefined)return res.status(400).json({error:'No changes'});if(name!==undefined&&(typeof name!=='string'||!name.trim()||name.length>80)||price!==undefined&&(!Number.isSafeInteger(price)||price<0||price>1000000)||active!==undefined&&typeof active!=='boolean')return res.status(400).json({error:'Invalid fields'});const c=await pool.connect();try{await c.query('BEGIN');const r=await c.query('UPDATE shop_items SET name=COALESCE($1,name),price=COALESCE($2,price),active=COALESCE($3,active),updated_at=now() WHERE id=$4 RETURNING *',[name?.trim()??null,price??null,active??null,req.params.id]);if(!r.rowCount){await c.query('ROLLBACK');return res.status(404).json({error:'Item not found'})}await audit(c,'shop.update',req.params.id,{name,price,active});await c.query('COMMIT');res.json(r.rows[0])}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}));
+app.get('/api/admin/audit',auth,db,wrap(async(req,res)=>{const r=await pool.query('SELECT id,action,target,details,created_at FROM audit_log ORDER BY id DESC LIMIT 60');res.json(r.rows)}));
+app.post('/api/admin/settings',auth,db,wrap(async(req,res)=>{const {key,value}=req.body;if(!['maintenance','matchmaking'].includes(key)||typeof value!=='boolean')return res.status(400).json({error:'Invalid setting'});const c=await pool.connect();try{await c.query('BEGIN');await c.query('INSERT INTO settings(key,value) VALUES($1,$2) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value',[key,String(value)]);await audit(c,'setting.change',key,{value});await c.query('COMMIT');res.json({key,value})}catch(e){await c.query('ROLLBACK');throw e}finally{c.release()}}));
+app.use((err,req,res,next)=>{console.error('Request error',err.code||err.message);res.status(500).json({error:'Server error'})});
+app.listen(port,'0.0.0.0',()=>console.log('HYBRID admin API listening on',port));
